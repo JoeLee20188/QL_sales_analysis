@@ -1,0 +1,312 @@
+---
+title: "前海人寿个险代理人评分卡模型"
+author: "liwb"
+date: "2018年6月22日"
+output:
+  html_document: default
+  pdf_document: default
+  word_document: default
+---
+#前言
+
+##背景说明
+
+###个险渠道是寿险公司重要的业务渠道之一，而个险渠道的壮大主要取决于营销员队伍，在过去的十几年中，一直以人海战术为主要模式，行业个险代理人呈现出高增员高脱落的态势，随着时代的发展，行业也在思考这种模式是否仍然有效？不少寿险公司逐渐探索精英代理人路线，即不再专注于代理人数量，而是寻找高素质，可持续为公司创造保费收入的代理人。本文拟应用本司的代理人数据（约5.1W名，包括已经离职的）探索绩优代理人的属性，以便在以后的增员中做一定的参考。
+
+##整体思路
+
+###从数据平台抽取数据，利用sas进行前期的数据清洗，形成模型的训练数据，再做逻辑回归，最后利用WOE转换形成评分卡。
+
+##模型训练数据来源说明
+
+###训练数据共有五个变量，其中fig为响应变量，age_com,education,sex,ifnative这四个为自变量，下面对每个变量的含义和数据清洗大致过程进行说明：
+
+###1.fig,为二分类的响应变量，表示营销员入司后是否为绩优的人员（1为绩优，0为非绩优）。绩优的条件有两方面，一是入司后的累计业绩（FYB新折）大于等于其司龄*8000，即平均每月为公司贡献8kp的保费；二是其累计期交保单（承保日期在2017年3月31日及之前的）在2018年5月31日仍然生效的比例需大于等于70%，即累计13月保费继续率不低于70per。
+
+###2.age_com,为营销员入司时的年龄，是自变量中唯一的连续型数值变量，因考虑到我司已成立已超过5年了，用其现在的年龄会有误差，故选择其入司时的年龄，通过身份证号码与其签约时间计算而来。
+
+###3.education，为营销员的学历背景，共有中技，中专，高中，大专，本科，研究生，博士7个水平，在逻辑回归中，属性变量的值通常为两种水平，这里将中技，中专，高中和大专分为一类，值为0，本科，研究生，博士分为一类，值为1。
+
+###4.sex，为营销员的性别，1为男性，0为女性。
+
+###5.ifnative，1表示营销员的籍贯与分公司所在的行政区域是一致的，0表示反之，例如，深圳分公司则判断其身份证号前六位是否为440300；广东分公司则判断其身份证号前两位是否为44。
+
+###6.其他说明，营销员包含了已经离职的；非中国大陆居民的营销员其id难以处理，作直接删除这种观测值。
+
+##一、读入已清洗完毕的训练数据
+```{r setup, include=TRUE}
+traindata<-read.csv("营销员分析数据源.csv");
+head(traindata,num=5L);
+```
+##二、变量分析
+###1.单变量分析
+###>在五个自变量中只有年龄是连续型随机变量
+```{r,include=TRUE}
+library("ggplot2");
+ggplot(traindata, aes(x = age_com, y = ..density..)) + geom_histogram(fill = "blue", colour = "grey60", size = 0.2, alpha = 0.2) + geom_density()
+```
+
+###>从它的概率密度函数分布图可以看到，年龄变量大致呈正态分布，符合统计分析的假设
+###2.变量之间的相关性（共线性）
+###>建模之前首先得检验变量之间（包括自变量和响应变量）的相关性，如果变量之间相关性显著，会影响模型的预测效果
+```{r}
+library("corrplot");
+cor1<-cor(traindata);
+corrplot(cor1);corrplot(cor1,method="number");
+```
+
+###>从上面这两张相关系数矩阵图可以看到，各变量之间的相关性是非常小的（年龄和婚姻状况最高，但也只有0.44，可以接受），由于各自变量间的的相关性都较小，可以初步判断不存在多重共线性
+##三、切分数据集
+```{r}
+table(traindata$fig)
+```
+###>从上表我们可以看到，绩优的观测值只有2350个，占比4.87%，因此需要对非平衡数据进行处理，采用SMOTE算法，对稀有事件进行超级采样，将数据随机分成相同的两份
+
+```{r}
+library("caret")
+set.seed(1234) 
+splitIndex<-createDataPartition(traindata$fig,time=1,p=0.5,list=FALSE) 
+train<-traindata[splitIndex,] 
+test<-traindata[-splitIndex,] 
+prop.table(table(train$fig)) 
+prop.table(table(test$fig)) 
+```
+###>从上面两张表我们可以看到，随机拆分的分类结果是平衡的，仍有4.54%的代表，因此可以使用这份切割的数据进行建模及预测
+
+##四、Logistic回归（建立逻辑回归模型）
+###>Logistic回归在信用评分卡开发中起到核心作用。由于其特点，以及对自变量进行了证据权重转换（WOE），Logistic回归的结果可以直接转换为一个汇总表，即所谓的标准评分卡格式。
+###>1.首先利用glm函数对所有变量进行Logistic回归建模，模型如下：
+```{r}
+fit1<-glm(fig~.,train,family = "binomial")
+summary(fit1)
+```
+###>可以看出，利用全变量进行回归，模型拟合效果并不是很好，其中marry这个变量的p值未能通过检验，在此直接剔除这个变量，利用剩余的变量对fig进行回归，模型如下：
+```{r}
+fit2<-glm(fig~education+age_com+sex+ifnative,train,family = "binomial")
+summary(fit2)
+```
+###>第二个回归模型所有变量都通过了检验，其赤池值（AIC）也相对较小一些，所以模型的拟合效果更好些
+###>2.模型检验
+###>通常一个二值分类器可以通过ROC（Receiver Operating Characteristic）曲线和AUC值来评价优劣
+```{r}
+pre <- predict(fit2,test)
+library("pROC")
+modelroc <- roc(test$fig,pre)
+plot(modelroc, print.auc=TRUE, auc.polygon=TRUE, grid=c(0.1, 0.2),
+     grid.col=c("green", "red"), max.auc.polygon=TRUE,
+     auc.polygon.col="skyblue", print.thres=TRUE)
+```
+
+###>如上图所示，AUC值只有0.6，说明该模型只有一定的预测准确性
+
+##五、WOE转换
+###>证据权重（Weight of Evidence,WOE）转换可以将Logistic回归模型转变为标准评分卡格式
+###>1.将四个变量进行分箱
+```{r}
+ cutage_com= c(-Inf,20,25,30,35,40,45,50,55,60,Inf)
+   plot(cut(train$age_com,cutage_com))
+```
+
+```{r}
+ cuteducation= c(-Inf,0,1,Inf)
+   plot(cut(train$education,cuteducation))
+```
+
+```{r}
+ cutsex= c(-Inf,0,1,Inf)
+   plot(cut(train$sex,cutsex))
+```
+
+```{r}
+ cutifnative= c(-Inf,0,1,Inf)
+   plot(cut(train$ifnative,cutifnative))
+```
+
+###>2.计算权重（WOE值）
+
+###>年龄
+```{r}
+   totalgood = as.numeric(table(train$fig))[1]
+   totalbad = as.numeric(table(train$fig))[2]
+   getWOE <- function(a,p,q)
+   {
+      Good <- as.numeric(table(train$fig[a > p & a <= q]))[1]
+      Bad <- as.numeric(table(train$fig[a > p & a <= q]))[2]
+      WOE <- log((Bad/totalbad)/(Good/totalgood),base = exp(1))
+      return(WOE)
+   }
+   age_comlessthan20.WOE=getWOE(train$age_com,-Inf,20)
+   age_com20to25.WOE=getWOE(train$age_com,20,25)
+   age_com25to30.WOE=getWOE(train$age_com,25,30)
+   age_com30to35.WOE=getWOE(train$age_com,30,35)
+   age_com35to40.WOE=getWOE(train$age_com,35,40)
+   age_com40to45.WOE=getWOE(train$age_com,40,45)
+   age_com45to50.WOE=getWOE(train$age_com,45,50)
+   age_com50to55.WOE=getWOE(train$age_com,50,55)
+   age_com55to60.WOE=getWOE(train$age_com,55,60)
+   age_commorethan.WOE=getWOE(train$age_com,60,Inf)
+   age_com.WOE=c(age_comlessthan20.WOE,age_com20to25.WOE,age_com25to30.WOE,age_com30to35.WOE,age_com35to40.WOE,
+            age_com40to45.WOE,age_com45to50.WOE,age_com50to55.WOE,age_com55to60.WOE,age_commorethan.WOE)
+   age_com.WOE
+```
+###>学历
+```{r}
+   educationlessthan0.WOE=getWOE(train$education,-Inf,0)
+   education0to1.WOE=getWOE(train$education,0,1)
+   educationmorethan.WOE=getWOE(train$education,1,Inf)
+   education.WOE=c(educationlessthan0.WOE,education0to1.WOE,educationmorethan.WOE)
+   education.WOE
+```
+###>性别
+```{r}
+   sexlessthan0.WOE=getWOE(train$sex,-Inf,0)
+   sex0to1.WOE=getWOE(train$sex,0,1)
+   sexmorethan.WOE=getWOE(train$sex,1,Inf)
+   sex.WOE=c(sexlessthan0.WOE,sex0to1.WOE,sexmorethan.WOE)
+   sex.WOE
+```
+###>是否本分公司行政区域内的人
+```{r}
+   ifnativelessthan0.WOE=getWOE(train$ifnative,-Inf,0)
+   ifnative0to1.WOE=getWOE(train$ifnative,0,1)
+   ifnativemorethan.WOE=getWOE(train$ifnative,1,Inf)
+   ifnative.WOE=c(ifnativelessthan0.WOE,ifnative0to1.WOE,ifnativemorethan.WOE)
+   ifnative.WOE
+```
+###>3.WOE变换
+```{r}
+ tmp.age <- 0
+    for(i in 1:nrow(train)) {
+      if(train$age_com[i] <= 20)
+        tmp.age[i] <- age_comlessthan20.WOE
+      else if(train$age_com[i] <= 25)
+        tmp.age[i] <- age_com20to25.WOE
+      else if(train$age_com[i] <= 30)
+        tmp.age[i] <- age_com25to30.WOE
+      else if(train$age_com[i] <= 35)
+        tmp.age[i] <- age_com30to35.WOE
+      else if(train$age_com[i] <= 40)
+        tmp.age[i] <- age_com35to40.WOE
+      else if(train$age_com[i] <= 45)
+        tmp.age[i] <- age_com40to45.WOE
+      else if(train$age_com[i] <= 50)
+        tmp.age[i] <- age_com45to50.WOE
+      else if(train$age_com[i] <= 55)
+        tmp.age[i] <- age_com50to55.WOE
+      else if(train$age_com[i] <= 60)
+        tmp.age[i] <- age_com55to60.WOE
+      else
+        tmp.age[i] <- age_commorethan.WOE
+    }
+ tmp.education <- 0
+    for(i in 1:nrow(train)) {
+      if(train$education[i] <= 0)
+        tmp.education[i] <- educationlessthan0.WOE
+      else if(train$education[i] <= 1)
+        tmp.education[i] <- education0to1.WOE
+      else
+        tmp.education[i] <- educationmorethan.WOE
+    }
+  tmp.sex <- 0
+    for(i in 1:nrow(train)) {
+      if(train$sex[i] <= 0)
+        tmp.sex[i] <- sexlessthan0.WOE
+      else if(train$sex[i] <= 1)
+        tmp.sex[i] <- sex0to1.WOE
+      else
+        tmp.sex[i] <- sexmorethan.WOE
+    }
+   tmp.ifnative <- 0
+    for(i in 1:nrow(train)) {
+      if(train$ifnative[i] <= 0)
+        tmp.ifnative[i] <- ifnativelessthan0.WOE
+      else if(train$ifnative[i] <= 1)
+        tmp.ifnative[i] <- ifnative0to1.WOE
+      else
+        tmp.ifnative[i] <- ifnativemorethan.WOE
+    }
+    
+    table(tmp.age)
+    table(tmp.education)
+    table(tmp.sex)
+    table(tmp.ifnative)
+```
+###>4.WOE DataFrame构建
+```{r}
+trainWOE =cbind.data.frame(tmp.age,tmp.education,tmp.sex,tmp.ifnative)
+```
+
+##六、评分卡的创建和实施
+```{r}
+trainWOE$y=train$fig
+glm.fit = glm(y~.,data = trainWOE,family = binomial(link = logit))
+summary(glm.fit)
+coe = (glm.fit$coefficients)
+p <- 20/log(2)
+q <- 600-20*log(15)/log(2)
+Score=q + p*{as.numeric(coe[1])+as.numeric(coe[2])*tmp.age+as.numeric(coe[3])*tmp.education+as.numeric(coe[4])*tmp.sex+as.numeric(coe[5])*tmp.ifnative}
+base <- q + p*as.numeric(coe[1])
+base
+```
+###上述的含义为：假设一个阀值，能够成为绩优的概率为15/15（100%）时为600分，每低40分，能成为绩优的概率下降1/15（13%）
+
+###>1.对各变量进行打分
+###>年龄
+```{r}
+    age_comlessthan20.SCORE = round(p*as.numeric(coe[2])*age_comlessthan20.WOE,0)
+    age_com20to25.SCORE = round(p*as.numeric(coe[2])*age_com20to25.WOE,0)
+    age_com25to30.SCORE = round(p*as.numeric(coe[2])*age_com25to30.WOE,0)
+    age_com30to35.SCORE = round(p*as.numeric(coe[2])*age_com30to35.WOE,0)
+    age_com35to40.SCORE = round(p*as.numeric(coe[2])*age_com35to40.WOE,0)
+    age_com40to45.SCORE = round(p*as.numeric(coe[2])*age_com40to45.WOE,0)
+    age_com45to50.SCORE = round(p*as.numeric(coe[2])*age_com45to50.WOE,0)
+    age_com50to55.SCORE = round(p*as.numeric(coe[2])*age_com50to55.WOE,0)
+    age_com55to60.SCORE = round(p*as.numeric(coe[2])*age_com55to60.WOE,0)
+    age_commorethan.SCORE= round(p*as.numeric(coe[2])*age_commorethan.WOE,0)
+    age.SCORE =c(age_comlessthan20.SCORE,age_com20to25.SCORE,age_com25to30.SCORE,age_com30to35.SCORE,age_com35to40.SCORE,age_com40to45.SCORE,age_com45to50.SCORE,age_com50to55.SCORE,age_com55to60.SCORE,age_commorethan.SCORE)
+    age.SCORE
+```
+###>学历
+```{r}
+   educationlessthan0.SCORE=round(p*as.numeric(coe[3])*educationlessthan0.WOE,0)
+   education0to1.SCORE=round(p*as.numeric(coe[3])*education0to1.WOE,0)
+   educationmorethan.SCORE=round(p*as.numeric(coe[3])*educationmorethan.WOE,0)
+   education.SCORE=c(educationlessthan0.SCORE,education0to1.SCORE,educationmorethan.SCORE)
+   education.SCORE
+```
+###>性别
+```{r}
+   sexlessthan0.SCORE=round(p*as.numeric(coe[4])*sexlessthan0.WOE,0)
+   sex0to1.SCORE=round(p*as.numeric(coe[4])*sex0to1.WOE,0)
+   sexmorethan.SCORE=round(p*as.numeric(coe[4])*sexmorethan.WOE,0)
+   sex.SCORE=c(sexlessthan0.SCORE,sex0to1.SCORE,sexmorethan.SCORE)
+   sex.SCORE
+```
+###>是否本分公司行政区域内的人
+```{r}
+   ifnativelessthan0.SCORE=round(p*as.numeric(coe[5])*ifnativelessthan0.WOE,0)
+   ifnative0to1.SCORE=round(p*as.numeric(coe[5])*ifnative0to1.WOE,0)
+   ifnativemorethan.SCORE=round(p*as.numeric(coe[5])*ifnativemorethan.WOE,0)
+   ifnative.SCORE=c(ifnativelessthan0.SCORE,ifnative0to1.SCORE,ifnativemorethan.SCORE)
+   ifnative.SCORE
+```
+###>3.最终生成的评分卡如下
+```{r,include=TRUE}
+library("xlsx")
+score_card1<-read.xlsx("score_card.xlsx",sheetIndex = 1,encoding = "UTF-8")
+score_card1
+```
+
+###结论：
+
+###1.绩优营销员画像为年龄30-40岁；学历本科及以上；女性；籍贯在分公司行政区域内；
+
+###2.具体实施，个人得分=基础分（434）+各维度得分（如上表），最终分值参考：400分成为绩优概率为67%；500分成为绩优的概率为83%；
+
+###3.关于模型，AUC值为0.6，其实并不具有强的预测性，后续需要收集更多的营销员属性，诸如其家庭成员个数，负债率，第三方信用评分，微信好友个数，颜值评分等等多个维度（可要求入职时多填相关信息），持续调整数据结构，不断地训练和优化模型，我们才能够找到更加准确的绩优营销员的画像，从而实现定向增员，打造一支强有力的个险队伍，促进业务发展。
+
+###PS:数据清洗过程源码可访问 https://github.com/JoeLee20188/XNPH 获取“FSL客户分析.sas”
+
+
+
+
